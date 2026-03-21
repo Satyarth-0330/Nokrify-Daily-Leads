@@ -1,9 +1,7 @@
 name: Nokrify Daily Lead Scraper
 
 on:
-  schedule:
-    # Runs at 03:30 UTC every day, which is 9:00 AM IST
-    - cron: '30 3 * * *'
+
   workflow_dispatch: # Allows manual trigger from GitHub Actions tab
 
 jobs:
