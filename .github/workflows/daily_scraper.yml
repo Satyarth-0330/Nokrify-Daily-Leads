@@ -1,8 +1,7 @@
 name: Nokrify Daily Lead Scraper
 
 on:
-
-  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab and Webpage
 
 jobs:
   scrape-and-export:
@@ -26,4 +25,5 @@ jobs:
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          SCRAPINGDOG_API_KEY: ${{ secrets.SCRAPINGDOG_API_KEY }}
         run: python nokrify_cloud_scraper.py
