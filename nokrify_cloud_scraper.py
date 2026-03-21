@@ -4,7 +4,6 @@ import time
 import requests
 import re
 from bs4 import BeautifulSoup
-from ddgs import DDGS
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from urllib.parse import urlparse
@@ -12,6 +11,7 @@ from urllib.parse import urlparse
 # Settings
 SHEET_ID = os.environ.get("SHEET_ID")
 GOOGLE_CRED_JSON = os.environ.get("GOOGLE_CREDENTIALS")
+SCRAPINGDOG_API_KEY = os.environ.get("SCRAPINGDOG_API_KEY", "69be41b5af72e60060716a82")
 
 TARGET_COUNT = 100
 LOCATIONS = ["Noida", "Delhi", "Gurugram", "Gurgaon", "Delhi NCR", "Meerut"]
@@ -42,7 +42,7 @@ def extract_contact_info(url):
         return None, None
 
 def extract_phones_from_text(text):
-    """Extracts mobile numbers from raw text (like DDG snippets)."""
+    """Extracts mobile numbers from raw text (like snippets)."""
     if not text:
         return None
     phone_pattern = r'(?:\+91[-.\s]?)?([6789]\d{9})'
@@ -50,19 +50,43 @@ def extract_phones_from_text(text):
     return phones[0] if phones else None
 
 def is_consultancy(text):
-    """Returns True if the text contains blacklisted consultancy keywords."""
     if not text: return False
     text_lower = text.lower()
     return any(word in text_lower for word in BLACKLIST)
 
 def passes_location_filter(text):
-    """Returns True if the text contains at least one of our strictly approved locations."""
     if not text: return False
     text_lower = text.lower()
     return any(loc.lower() in text_lower for loc in LOCATIONS)
 
+def dog_search(query, is_maps=False):
+    """Calls the ScrapingDog API directly for Google Search or Maps."""
+    endpoint = "google_maps" if is_maps else "google"
+    url = f"https://api.scrapingdog.com/{endpoint}"
+    params = {
+        "api_key": SCRAPINGDOG_API_KEY,
+        "query": query,
+        "results": 15 if is_maps else 10,
+        "country": "in"
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            if is_maps:
+                return data.get("search_results", []) or data.get("local_results", [])
+            else:
+                return data.get("organic_data", [])
+        else:
+            print(f"ScrapingDog Error: {response.text}")
+            return []
+    except Exception as e:
+        print(f"ScrapingDog Request Failed: {e}")
+        return []
+
 def main():
-    print("Starting Nokrify Quality Filters Phase 2...")
+    print("Starting Nokrify Ultimate Cloud Scraper (ScrapingDog Powered)...")
     if not SHEET_ID or not GOOGLE_CRED_JSON:
         print("Missing Google Sheets credentials.")
         return
@@ -78,7 +102,6 @@ def main():
         print(f"Error connecting to Google Sheets: {e}")
         return
 
-    # Fetch existing data for Deduplication
     print("Fetching existing companies to prevent duplicates...")
     try:
         existing_records = sheet.get_all_records(default_blank="")
@@ -97,18 +120,15 @@ def main():
             
         clean_name = str(name).strip().lower()
         if not clean_name or clean_name in existing_companies:
-            return True # Duplicate, but keep going
+            return True
         if source_link and source_link in existing_links:
             return True
             
-        # STRICT FILTERS: Consultancies and Bad locations dropping
         combined_text = f"{name} {website} {source_link} {snippet}".lower()
         if is_consultancy(combined_text):
             print(f"Dropped Consultancy: {name}")
             return True
             
-        # If no preferred location is physically found anywhere in the listing, drop it.
-        # This completely eliminates random USA/Florida results.
         if not passes_location_filter(combined_text) and not passes_location_filter(location):
             print(f"Dropped Wrong Location: {name}")
             return True
@@ -125,112 +145,114 @@ def main():
             "source_link": source_link or "",
             "location": location
         })
-        print(f"✅ Found High-Quality Lead: {name.title()} ({len(companies_to_add)}/{TARGET_COUNT})")
+        print(f"✅ Found Lead: {name.title()} ({len(companies_to_add)}/{TARGET_COUNT})")
         return len(companies_to_add) < TARGET_COUNT
 
 
     # ==========================================
-    # STRATEGY 1: Maps Dorks (BPOs & Call Centers, Direct phone extraction)
+    # STAGE 1: Maps API (BPOs & Call Centers, Direct phone extraction)
     # ==========================================
-    print("\n--- Starting DDG Local Maps Search ---")
-    keywords = ["BPO", "Call Center", "Inbound Call Center", "Outbound Call Center"]
-    with DDGS() as ddgs:
-        for loc in LOCATIONS:
+    print("\n--- Starting ScrapingDog Google Maps Search ---")
+    map_keywords = ["BPO", "International Call Center"]
+    for loc in LOCATIONS:
+        if len(companies_to_add) >= TARGET_COUNT: break
+        for kw in map_keywords:
             if len(companies_to_add) >= TARGET_COUNT: break
-            for kw in keywords:
+            query = f"{kw} {loc}"
+            
+            results = dog_search(query, is_maps=True)
+            for r in results:
+                name = r.get('title') or r.get('name', '')
+                phone = extract_phones_from_text(r.get('phone', ''))
+                website = r.get('website') or r.get('url', '')
+                address = r.get('address', '')
+                
+                email = ""
+                if website and not phone:
+                    email, p2 = extract_contact_info(website)
+                    if p2: phone = p2
+                
+                # Maps natively provides highly accurate direct business locations
+                try_add_lead(name, "BPO/Call Center", website, email, phone, website or f"Maps: {query}", address, snippet=address)
                 if len(companies_to_add) >= TARGET_COUNT: break
-                query = f"{kw} {loc}"
-                try:
-                    # Maps doesn't support timelimit but yields evergreen highly accurate BPOs
-                    results = ddgs.maps(query, max_results=15)
-                    if results:
-                        for r in results:
-                            name = r.get('title', '')
-                            phone = extract_phones_from_text(r.get('phone', ''))
-                            website = r.get('url', '')
-                            address = r.get('address', '')
-                            
-                            email = ""
-                            if website and not phone:
-                                email, p2 = extract_contact_info(website)
-                                if p2: phone = p2
-                            
-                            try_add_lead(name, "BPO/Call Center", website, email, phone, website or f"Maps: {query}", address, snippet=address)
-                            if len(companies_to_add) >= TARGET_COUNT: break
-                except Exception as e:
-                    print(f"Maps Skip {query}: {e}")
 
     # ==========================================
-    # STRATEGY 2: Recent Job Portals Pivot (Naukri/Apna)
-    # Time Limit 'w' forces results indexed in the past 7 days!
+    # STAGE 2: Instagram Vacancy Scraping
     # ==========================================
-    print("\n--- Starting Job Portals Crawl (Past Week Only) ---")
+    print("\n--- Starting ScrapingDog Instagram Search ---")
+    ig_queries = [
+        f'site:instagram.com ("Hiring" OR "Vacancy") "BPO" "{loc}"' for loc in LOCATIONS
+    ]
+    for query in ig_queries:
+        if len(companies_to_add) >= TARGET_COUNT: break
+        # We append 'after:2026-01-01' trick directly in google search query for recency if needed, but
+        # ScrapingDog is fresh enough.
+        results = dog_search(query)
+        for r in results:
+            link = r.get('link', '')
+            snippet = str(r.get('snippet', '')) + " " + str(r.get('title', ''))
+            
+            phone = extract_phones_from_text(snippet)
+            
+            # Guess company from IG handle
+            name_match = re.search(r'@(\w+)', snippet)
+            company_name = name_match.group(1) if name_match else "Instagram HR Post"
+            
+            email, p2 = extract_contact_info(link)
+            if p2 and not phone: phone = p2
+                
+            try_add_lead(company_name, "Instagram Hiring", "", email, phone, link, "Delhi NCR Area", snippet=snippet)
+            if len(companies_to_add) >= TARGET_COUNT: break
+
+    # ==========================================
+    # STAGE 3: Job Portals Reverse Research (Naukri/Apna)
+    # ==========================================
+    print("\n--- Starting ScrapingDog Job Portals Crawl ---")
     job_queries = [
         f'site:naukri.com/job-listings "BPO" "HR" "{loc}"' for loc in LOCATIONS
     ] + [
         f'site:apna.co/job "BPO" "{loc}"' for loc in LOCATIONS
     ]
-    with DDGS() as ddgs:
-        for query in job_queries:
+    for query in job_queries:
+        if len(companies_to_add) >= TARGET_COUNT: break
+        # Google Dork: 'qdr:w' means past week, 'qdr:d' means past day
+        fresh_query = f"{query} qdr:w" 
+        results = dog_search(fresh_query)
+        for r in results:
+            link = r.get('link', '')
+            snippet = str(r.get('snippet', '')) + " " + str(r.get('title', ''))
+            
+            name = "Job Portal Lead"
+            if "naukri.com" in link:
+                parts = link.split('-')
+                name = parts[-3] if len(parts) > 3 else name
+                
+            phone = extract_phones_from_text(snippet)
+            email, p2 = extract_contact_info(link)
+            if p2 and not phone: phone = p2
+                
+            try_add_lead(name, "Job Portal Hiring", "", email, phone, link, "Delhi NCR Area", snippet=snippet)
             if len(companies_to_add) >= TARGET_COUNT: break
-            try:
-                # 'w' forces ONLY results indexed in the last week
-                results = ddgs.text(query, timelimit='w', max_results=10)
-                if results:
-                    for r in results:
-                        link = r.get('href', '')
-                        snippet = r.get('body', '') + " " + r.get('title', '')
-                        
-                        # Guess company from Naukri/Apna URL structure or snippet
-                        # site:naukri.com/job-listings-bpo-executive-company-name-delhi-ncr-1to5years-123456
-                        name = "Job Portal Lead"
-                        if "naukri.com" in link:
-                            parts = link.split('-')
-                            # very basic guess
-                            name = parts[-3] if len(parts) > 3 else name
-                            
-                        phone = extract_phones_from_text(snippet)
-                        # Job platforms usually hide HR numbers, but sometimes it's in the snippet!
-                        
-                        # Use our Authenticator!
-                        email, p2 = extract_contact_info(link)
-                        if p2: phone = p2
-                            
-                        # Use snippet to infer location properly
-                        try_add_lead(name, "Job Portal Hiring", "", email, phone, link, "Delhi NCR Area", snippet=snippet)
-                        if len(companies_to_add) >= TARGET_COUNT: break
-            except Exception as e:
-                print(f"Job Portal Skip {query}: {e}")
-
+            
     # ==========================================
-    # STRATEGY 3: ATS Platforms Crawl 
+    # STAGE 4: LinkedIn HR Discovery
     # ==========================================
-    print("\n--- Starting ATS Platform Crawl (Lever/Greenhouse) ---")
-    ats_queries = [
-        f'site:lever.co OR site:greenhouse.io ("BPO" OR "Sales" OR "Customer Support") "{loc}"' for loc in LOCATIONS
+    print("\n--- Starting ScrapingDog LinkedIn Search ---")
+    linkedin_queries = [
+        f'site:linkedin.com/in ("HR" OR "Talent Acquisition") "BPO" "{loc}"' for loc in LOCATIONS
     ]
-    with DDGS() as ddgs:
-        for query in ats_queries:
+    for query in linkedin_queries:
+        if len(companies_to_add) >= TARGET_COUNT: break
+        results = dog_search(query)
+        for r in results:
+            link = r.get('link', '')
+            snippet = str(r.get('snippet', '')) + " " + str(r.get('title', ''))
+            
+            # Extract name from LinkedIn title
+            name_part = str(r.get('title', '')).split('-')[0].strip()
+            
+            try_add_lead(name_part, "LinkedIn HR Profile", "", "", extract_phones_from_text(snippet), link, "Delhi NCR Area", snippet=snippet)
             if len(companies_to_add) >= TARGET_COUNT: break
-            try:
-                # Past Month for ATS (Startup jobs last up to 30 days)
-                results = ddgs.text(query, timelimit='m', max_results=10)
-                if results:
-                    for r in results:
-                        link = r.get('href', '')
-                        snippet = r.get('body', '')
-                        
-                        parsed = urlparse(link)
-                        path = parsed.path.strip('/').split('/')
-                        company_name = path[0] if path else "ATS Startup Lead"
-                        
-                        # Web crawl to extract real contact details
-                        email, phone = extract_contact_info(link)
-                        
-                        try_add_lead(company_name, "Startup/Tech Role", f"https://www.{company_name}.com", email, phone, link, "Delhi NCR Area", snippet=snippet)
-                        if len(companies_to_add) >= TARGET_COUNT: break
-            except Exception as e:
-                print(f"ATS skip {query}: {e}")
 
 
     # ==========================================
@@ -240,9 +262,9 @@ def main():
         next_sno = len(existing_records) + 1
         rows_to_insert = []
         for c in companies_to_add:
-            status = "New Filtered Lead"
+            status = "New Filtered ScrapingDog Lead"
             if not c['hr_email'] and not c['hr_phone']:
-                status = "Contact Missing (Needs Manual Check)"
+                status = "Contact Missing (Check Source)"
                 
             row = [
                 next_sno,                           # S.No
